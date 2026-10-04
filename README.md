@@ -33,8 +33,6 @@ with `↑ N older` / `↓ N newer` markers at the hidden ends.
 
 ![fan layout — ten agents, finished ones compacted, selection expanded](fan-layout.png)
 
-![the transcript side of the same fan-out](orchestrator-view.png)
-
 ## How it works
 
 Tracks `tool_execution_start` / `tool_execution_update` / `tool_execution_end`
