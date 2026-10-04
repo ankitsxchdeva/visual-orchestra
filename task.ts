@@ -154,15 +154,22 @@ export interface SubagentProgress {
  * every tool_execution_start and assistant message_end so callers can stream
  * live status at zero token cost. Resolves with the last assistant text.
  */
-function runPi(
+export function runPi(
 	args: string[],
 	signal: AbortSignal | undefined,
 	onProgress?: (p: SubagentProgress) => void,
+	cmd = "pi",
 ): Promise<{ text: string; progress: SubagentProgress }> {
+	if (signal?.aborted) return Promise.reject(new Error("subagent cancelled"));
 	return new Promise((resolve, reject) => {
-		const child = spawn("pi", args, { stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
 		let buffer = "";
 		let err = "";
+		let exited = false;
+		let killed = false;
+		let settled = false;
+		let idleTimer: ReturnType<typeof setTimeout> | undefined;
+		let escalationTimer: ReturnType<typeof setTimeout> | undefined;
 		const progress: SubagentProgress = { activity: "starting", turns: 0, tokens: 0, lastText: "" };
 		const emit = () => onProgress?.({ ...progress });
 
@@ -194,30 +201,76 @@ function runPi(
 		};
 
 		const decoder = new StringDecoder("utf8");
-		child.stdout.on("data", (d) => {
+		const stdout = child.stdout!;
+		const stderr = child.stderr!;
+		const armIdleTimer = () => {
+			if (idleTimer) clearTimeout(idleTimer);
+			idleTimer = setTimeout(settle, 100);
+		};
+		stdout.on("data", (d) => {
 			buffer += decoder.write(d);
 			const lines = buffer.split("\n");
 			buffer = lines.pop() || "";
 			for (const line of lines) processLine(line);
+			// Post-exit chunk: a grandchild is still alive on this pipe.
+			if (exited && !settled) armIdleTimer();
 		});
 		// Only the tail is used, in the rejection message — cap it.
-		child.stderr.on("data", (d) => {
+		stderr.on("data", (d) => {
 			err = (err + d).slice(-8192);
+			if (exited && !settled) armIdleTimer();
 		});
-		const onAbort = () => child.kill("SIGTERM");
-		signal?.addEventListener("abort", onAbort, { once: true });
-		child.on("error", (e) => {
+		const cleanup = () => {
 			signal?.removeEventListener("abort", onAbort);
-			reject(e);
-		});
-		child.on("close", (code) => {
-			signal?.removeEventListener("abort", onAbort);
+			if (idleTimer) clearTimeout(idleTimer);
+			if (escalationTimer) clearTimeout(escalationTimer);
+		};
+		// Single settlement guard: close, stream end, idle timeout and error all
+		// funnel through settle() exactly once, then the streams are destroyed.
+		const settle = () => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			stdout.destroy();
+			stderr.destroy();
 			buffer += decoder.end();
 			if (buffer.trim()) processLine(buffer);
-			if (code === 0) resolve({ text: progress.lastText.trim() || "(subagent produced no output)", progress });
-			else if (code === 143 || child.signalCode === "SIGTERM") reject(new Error("subagent cancelled"));
-			else reject(new Error(`subagent exited ${code ?? child.signalCode}: ${err.trim().slice(0, 500)}`));
+			// We killed the child after abort: always report cancellation,
+			// regardless of the final exit code or signal (covers SIGKILL).
+			if (killed) reject(new Error("subagent cancelled"));
+			else if (child.exitCode === 0) resolve({ text: progress.lastText.trim() || "(subagent produced no output)", progress });
+			else if (child.exitCode === 143 || child.signalCode === "SIGTERM") reject(new Error("subagent cancelled"));
+			else reject(new Error(`subagent exited ${child.exitCode ?? child.signalCode}: ${err.trim().slice(0, 500)}`));
+		};
+		const onAbort = () => {
+			killed = true;
+			child.kill("SIGTERM");
+			// pi's own exec gates escalation on proc.killed, which is already true
+			// once SIGTERM is sent, so its SIGKILL never fires — gate on `exited`.
+			escalationTimer = setTimeout(() => {
+				if (!exited) child.kill("SIGKILL");
+			}, 5000);
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+		child.on("error", (e) => {
+			settled = true;
+			cleanup();
+			reject(e);
 		});
+		child.on("exit", () => {
+			exited = true;
+			// "close" waits for stdio to end too; a detached grandchild can hold a
+			// pipe open forever, so settle on both streams ended or the idle timer.
+			if (stdout.readableEnded && stderr.readableEnded) settle();
+			else armIdleTimer();
+		});
+		stdout.on("end", () => {
+			if (exited && !settled && stderr.readableEnded) settle();
+		});
+		stderr.on("end", () => {
+			if (exited && !settled && stdout.readableEnded) settle();
+		});
+		child.on("close", () => settle());
 		emit();
 	});
 }
