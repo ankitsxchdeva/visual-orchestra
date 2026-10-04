@@ -22,12 +22,16 @@ it if you already have one (see below).
 ## Usage
 
 - `/orchestra` or `ctrl+alt+o`: open the board (idle or mid-turn; interactive mode only)
+- `↑`/`↓` or `j`/`k`: move the selection; the selected agent expands to show its full task alongside its live activity
 - `esc`, `q`, or `ctrl+c`: close
 
 Layout adapts: radial for up to 4 agents when it fits (~88×22 minimum),
-horizontal fan beyond that, vertical on narrow terminals.
+horizontal fan beyond that, vertical on narrow terminals. Finished agents
+collapse to one-line rows so a long history stays readable; when the list
+overflows the screen the fan and vertical layouts scroll with the selection,
+with `↑ N older` / `↓ N newer` markers at the hidden ends.
 
-![fan layout — five agents in a column beside the hub](fan-layout.png)
+![fan layout — ten agents, finished ones compacted, selection expanded](fan-layout.png)
 
 ![the transcript side of the same fan-out](orchestrator-view.png)
 
@@ -48,3 +52,8 @@ Set `PI_ORCHESTRA_TOOL` to watch a different tool name.
 
 - pi 0.52.10 or newer (needs the `tool_execution_update` extension event; tested on 1.0.0)
 - A `task` tool for anything to appear on the board
+
+## Development
+
+- `node --test test/` — regression suite (settlement logic in `task.ts`, scroll-window math in `windowing.ts`)
+- `node scripts/demo.mjs --agents 10 --running 3 --keys up,up` — render the board with synthetic events, no model calls; used for the screenshots above

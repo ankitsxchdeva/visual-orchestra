@@ -26,6 +26,7 @@
 
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { scrollWindow } from "./windowing.ts";
 
 /** Tool whose executions appear on the board. */
 const TOOL_NAME = process.env.PI_ORCHESTRA_TOOL || "task";
@@ -47,6 +48,18 @@ interface AgentRow {
 
 /** Session-scoped board state. Events keep flowing while the view is closed. */
 const rows: AgentRow[] = [];
+
+/** Selection cursor: id of the selected row. Falls back to the newest row. */
+let selectedId: string | null = null;
+
+function selectedIndex(): number {
+	const i = rows.findIndex((r) => r.id === selectedId);
+	return i === -1 ? Math.max(0, rows.length - 1) : i;
+}
+
+function selectIndex(i: number): void {
+	selectedId = rows[i]?.id ?? null;
+}
 
 /** Set while the view is open; event handlers poke it to re-render. */
 let refreshView: (() => void) | undefined;
@@ -103,10 +116,11 @@ function totals(): { agents: number; turns: number; tokens: number } {
 	return { agents: rows.length, turns, tokens };
 }
 
-/** Width-aware clip (CJK/emoji safe). */
+/** Width-aware clip (CJK/emoji safe). truncateToWidth appends the ellipsis
+ *  itself when it truncates — pass ours through rather than adding a second. */
 function clip(text: string, max: number): string {
 	if (max <= 1) return "";
-	return visibleWidth(text) > max ? `${truncateToWidth(text, max - 1)}…` : text;
+	return visibleWidth(text) > max ? truncateToWidth(text, max, "…") : text;
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +154,9 @@ class Canvas {
 	}
 
 	text(x: number, y: number, s: string, style: StyleName): void {
+		// Cells are style-flat: strip SGR sequences (truncateToWidth emits them
+		// around its ellipsis) or the ESC bytes would render as literal text.
+		s = s.replace(/\u001b\[[0-9;]*m/g, "");
 		let col = x;
 		for (const ch of s) {
 			const cw = visibleWidth(ch);
@@ -217,24 +234,83 @@ function stateGlyph(row: AgentRow, pulse: boolean): { ch: string; style: StyleNa
 	return { ch: "✗", style: "error" };
 }
 
+/**
+ * Row height in the scrollable layouts. Running agents keep the full box
+ * (selected adds a task line); finished agents collapse to a one-line row
+ * (selected adds a full task line below it). Must stay in sync with
+ * drawAgentNode / drawCompactRow.
+ */
+function rowHeight(row: AgentRow, selected: boolean): number {
+	if (row.state === "running") return selected ? NH + 1 : NH;
+	return selected ? 2 : 1;
+}
+
+/** Box-drawing junction for the given open sides. */
+function tee(up: boolean, right: boolean, down: boolean, left: boolean): string {
+	if (up && right && down && left) return "┼";
+	if (up && down && left) return "┤";
+	if (up && right && down) return "├";
+	if (up && left) return "┘";
+	if (up && right) return "└";
+	if (down && left) return "┐";
+	if (down && right) return "┌";
+	if (up && down) return "│";
+	return "─";
+}
+
 function edgeStyle(row: AgentRow): StyleName {
 	return row.state === "running" ? "accent" : "borderMuted";
 }
 
-/** Node: title embedded in the top border, one content line, one stats line. */
-function drawAgentNode(c: Canvas, row: AgentRow, x: number, y: number, w: number, pulse: boolean): void {
-	const border = edgeStyle(row);
-	c.box(x, y, w, NH, border);
+/** Node: title embedded in the top border, one content line, one stats line.
+ *  Selected running nodes expand by one line to show the task as well. */
+function drawAgentNode(
+	c: Canvas,
+	row: AgentRow,
+	x: number,
+	y: number,
+	w: number,
+	pulse: boolean,
+	selected: boolean,
+	expand: boolean,
+): void {
+	const h = expand && selected && row.state === "running" ? NH + 1 : NH;
+	const border: StyleName = selected ? "text" : edgeStyle(row);
+	c.box(x, y, w, h, border);
 	const glyph = stateGlyph(row, pulse);
-	const nameStyle: StyleName = row.state === "running" ? "text" : "muted";
+	const nameStyle: StyleName = selected ? "textBold" : row.state === "running" ? "text" : "muted";
 	const name = clip(row.agent, w - 11);
 	// top border: ┌─ ● name ──────┐
 	c.set(x + 1, y, "─", border);
 	c.text(x + 2, y, ` ${glyph.ch} `, glyph.style);
 	c.text(x + 5, y, `${name} `, nameStyle);
-	const content = row.state === "running" ? row.activity || "starting" : row.task;
-	c.text(x + 2, y + 1, clip(content, w - 4), "dim");
-	c.text(x + 2, y + 2, clip(statLine(row), w - 4), "muted");
+	let line = y + 1;
+	if (row.state === "running") {
+		c.text(x + 2, line++, clip(row.activity || "starting", w - 4), "dim");
+		if (selected && expand) c.text(x + 2, line++, clip(row.task, w - 4), "dim");
+	} else {
+		c.text(x + 2, line++, clip(row.task, w - 4), "dim");
+	}
+	c.text(x + 2, line, clip(statLine(row), w - 4), "muted");
+}
+
+/** Finished agent as a one-line row: glyph, name, task preview, right-aligned
+ *  stats. Selected adds a full task line below. */
+function drawCompactRow(c: Canvas, row: AgentRow, x: number, y: number, w: number, selected: boolean): void {
+	const glyph = stateGlyph(row, false);
+	const stats = clip(statLine(row), Math.floor(w / 2));
+	const statsW = visibleWidth(stats);
+	c.text(x + w - statsW, y, stats, "muted");
+	c.text(x, y, glyph.ch, glyph.style);
+	const name = clip(row.agent, Math.max(1, Math.min(24, w - statsW - 6)));
+	c.text(x + 2, y, name, selected ? "textBold" : "muted");
+	if (selected) {
+		c.text(x + 2, y + 1, clip(row.task, w - 2), "dim");
+	} else {
+		const taskX = x + 2 + visibleWidth(name) + 2;
+		const taskW = x + w - statsW - 2 - taskX;
+		if (taskW > 4) c.text(taskX, y, clip(row.task, taskW), "dim");
+	}
 }
 
 function drawHub(c: Canvas, x: number, y: number): void {
@@ -247,8 +323,9 @@ function drawHub(c: Canvas, x: number, y: number): void {
 	c.text(center(stats), y + 3, stats, "dim");
 }
 
-/** Radial: hub center, nodes on cross spokes. Caller guarantees n <= 4 and fit. */
-function layoutRadial(c: Canvas, agents: AgentRow[], pulse: boolean): void {
+/** Radial: hub center, nodes on cross spokes. Caller guarantees n <= 4 and fit.
+ *  No scrolling here: selection only brightens the node (expand would break the slots). */
+function layoutRadial(c: Canvas, agents: AgentRow[], pulse: boolean, sel: number): void {
 	const cx = Math.floor(c.w / 2);
 	const cy = Math.floor(c.h / 2);
 	const NW = Math.max(MIN_NODE_W, Math.min(38, Math.floor((c.w - HW - 2 * SPOKE_H - 4) / 2)));
@@ -265,7 +342,8 @@ function layoutRadial(c: Canvas, agents: AgentRow[], pulse: boolean): void {
 	drawHub(c, hx0, hy0);
 	agents.forEach((row, i) => {
 		const [nx, ny] = slots[pick[i]];
-		drawAgentNode(c, row, nx, ny, NW, pulse);
+		drawAgentNode(c, row, nx, ny, NW, pulse, i === sel, false);
+		if (i === sel) c.text(nx - 2, ny, ">", "text");
 		const es = edgeStyle(row);
 		if (pick[i] === 1) {
 			// right: straight horizontal at cy
@@ -291,91 +369,117 @@ function layoutRadial(c: Canvas, agents: AgentRow[], pulse: boolean): void {
 	});
 }
 
-/** Fan: hub left, vertical spine, one branch per agent. For wide terminals. */
-function layoutFan(c: Canvas, agents: AgentRow[], pulse: boolean): void {
+/** Fan: hub left, vertical spine, one branch per agent. For wide terminals.
+ *  Overflow: shows a scroll window around the selected row instead of
+ *  silently dropping old agents; ↑/↓ indicators mark hidden ends. */
+function layoutFan(c: Canvas, agents: AgentRow[], pulse: boolean, sel: number): void {
 	const hx0 = 2;
 	const sx = hx0 + HW + 3;
 	const nx0 = sx + 4;
 	const NW = Math.max(MIN_NODE_W, c.w - nx0 - 2);
-	const per = NH + 1;
-	const budget = Math.max(1, Math.floor((c.h - 3) / per));
-	const shown = agents.slice(-budget);
-	const hidden = agents.length - shown.length;
-	const stackH = shown.length * per - 1;
-	const y0 = Math.max(1, Math.floor((c.h - stackH - (hidden > 0 ? 1 : 0)) / 2));
+	const GAP = 1;
+	const heights = agents.map((r, i) => rowHeight(r, i === sel));
+	const total = heights.reduce((a, b) => a + b, 0) + GAP * (agents.length - 1);
+	const fits = total <= c.h - 2;
+	// Overflow: row 0 stays free for the ↑ indicator, the last for hints.
+	const [s, e] = fits ? [0, agents.length] : scrollWindow(heights, GAP, Math.max(1, c.h - 3), sel);
+	const shownH = heights.slice(s, e);
+	const stackH = shownH.reduce((a, b) => a + b, 0) + GAP * (shownH.length - 1);
+	const y0 = fits ? Math.max(1, Math.floor((c.h - stackH) / 2)) : 1;
 	const hy0 = Math.min(Math.max(1, Math.floor(c.h / 2) - Math.floor(HH / 2)), c.h - HH - 1);
 	const hubMid = hy0 + 2;
 
 	drawHub(c, hx0, hy0);
-	shown.forEach((row, i) => {
-		const ny = y0 + i * per;
-		const nodeCy = ny + 1;
-		drawAgentNode(c, row, nx0, ny, NW, pulse);
+
+	const centers: number[] = [];
+	let y = y0;
+	agents.slice(s, e).forEach((row, i) => {
+		const h = shownH[i];
+		const nodeCy = h >= NH ? y + 1 : y;
+		centers.push(nodeCy);
+		const selected = s + i === sel;
+		if (row.state === "running") {
+			drawAgentNode(c, row, nx0, y, NW, pulse, selected, true);
+		} else {
+			drawCompactRow(c, row, nx0 + 2, y, NW - 3, selected);
+		}
 		const es = edgeStyle(row);
-		c.hline(sx + 1, nx0 - 1, nodeCy, es);
-		c.set(nx0, nodeCy, "┤", es);
+		c.hline(sx + 1, row.state === "running" ? nx0 - 1 : nx0, nodeCy, es);
+		if (row.state === "running") c.set(nx0, nodeCy, "┤", es);
+		if (selected) c.set(sx + 1, nodeCy, ">", "text");
+		y += h + GAP;
 	});
 
-	const firstCy = y0 + 1;
-	const lastCy = y0 + (shown.length - 1) * per + 1;
-	if (shown.length === 1) {
-		c.hline(sx + 1, nx0 - 1, firstCy, edgeStyle(shown[0]));
-		// No spine for a lone node: bridge hubMid..firstCy so the branch
-		// isn't floating one row away from the hub connector.
-		if (hubMid !== firstCy) {
-			c.vline(Math.min(firstCy, hubMid), Math.max(firstCy, hubMid), sx, "borderMuted");
-			c.set(sx, firstCy, firstCy < hubMid ? "┌" : "└", "borderMuted");
-		}
-	} else if (shown.length > 1) {
-		c.vline(firstCy, lastCy, sx, "borderMuted");
-		c.set(sx, firstCy, "┌", "borderMuted");
-		c.set(sx, lastCy, "└", "borderMuted");
-		for (let i = 1; i < shown.length - 1; i++) c.set(sx, y0 + i * per + 1, "├", "borderMuted");
-	}
+	// Spine spans the visible branches and reaches hubMid, so the hub
+	// connector always lands even when the window is scrolled past it.
+	const firstCy = centers[0];
+	const lastCy = centers[centers.length - 1];
+	const spineTop = Math.min(firstCy, hubMid);
+	const spineBot = Math.max(lastCy, hubMid);
+	c.vline(spineTop, spineBot, sx, "borderMuted");
+	for (const cy of centers) c.set(sx, cy, tee(cy > spineTop, true, cy < spineBot, cy === hubMid), "borderMuted");
 
 	// hub -> spine
-	if (shown.length > 0) {
-		c.set(hx0 + HW - 1, hubMid, "├", "borderMuted");
-		c.hline(hx0 + HW, sx - 1, hubMid, "borderMuted");
-		const onBranch = shown.some((_, i) => y0 + i * per + 1 === hubMid);
-		c.set(sx, hubMid, onBranch ? "┼" : "┤", "borderMuted");
-	}
+	c.set(hx0 + HW - 1, hubMid, "├", "borderMuted");
+	c.hline(hx0 + HW, sx - 1, hubMid, "borderMuted");
+	c.set(sx, hubMid, tee(hubMid > spineTop, centers.includes(hubMid), hubMid < spineBot, true), "borderMuted");
 
-	if (hidden > 0) c.text(2, c.h - 1, `+${hidden} older`, "dim");
+	if (s > 0) {
+		const up = `↑ ${s} older`;
+		c.text(c.w - up.length - 1, 0, up, "dim");
+	}
+	if (e < agents.length) c.text(2, c.h - 1, `↓ ${agents.length - e} newer`, "dim");
 }
 
-/** Vertical fan: hub top-left, spine below it, full-width nodes. Narrow terminals. */
-function layoutVertical(c: Canvas, agents: AgentRow[], pulse: boolean): void {
+/** Vertical fan: hub top-left, spine below it, full-width nodes. Narrow terminals.
+ *  Same scroll-window overflow as the wide fan. */
+function layoutVertical(c: Canvas, agents: AgentRow[], pulse: boolean, sel: number): void {
 	const hx0 = 1;
 	const hy0 = 0;
 	const sx = hx0 + 3;
 	const nx0 = sx + 3;
 	const NW = Math.max(12, c.w - nx0 - 1);
-	const per = NH + 1;
+	const GAP = 1;
 	const top = hy0 + HH + 1;
-	const budget = Math.max(1, Math.floor((c.h - top - 1) / per));
-	const shown = agents.slice(-budget);
-	const hidden = agents.length - shown.length;
+	const heights = agents.map((r, i) => rowHeight(r, i === sel));
+	const total = heights.reduce((a, b) => a + b, 0) + GAP * (agents.length - 1);
+	const avail = Math.max(1, c.h - top - 1);
+	const fits = total <= avail;
+	const [s, e] = fits ? [0, agents.length] : scrollWindow(heights, GAP, avail, sel);
+	const shownH = heights.slice(s, e);
 
 	drawHub(c, hx0, hy0);
-	const firstCy = top + 1;
-	const lastCy = top + (shown.length - 1) * per + 1;
 
-	if (shown.length > 0) {
-		c.set(sx, hy0 + HH - 1, "┬", "borderMuted");
-		c.vline(hy0 + HH, lastCy, sx, "borderMuted");
-	}
-	shown.forEach((row, i) => {
-		const ny = top + i * per;
-		const nodeCy = ny + 1;
-		drawAgentNode(c, row, nx0, ny, NW, pulse);
+	const centers: number[] = [];
+	let y = top;
+	agents.slice(s, e).forEach((row, i) => {
+		const h = shownH[i];
+		const nodeCy = h >= NH ? y + 1 : y;
+		centers.push(nodeCy);
+		const selected = s + i === sel;
+		if (row.state === "running") {
+			drawAgentNode(c, row, nx0, y, NW, pulse, selected, true);
+		} else {
+			drawCompactRow(c, row, nx0 + 2, y, NW - 3, selected);
+		}
 		const es = edgeStyle(row);
-		c.set(sx, nodeCy, i === shown.length - 1 ? "└" : "├", "borderMuted");
-		c.hline(sx + 1, nx0 - 1, nodeCy, es);
-		c.set(nx0, nodeCy, "┤", es);
+		c.hline(sx + 1, row.state === "running" ? nx0 - 1 : nx0, nodeCy, es);
+		if (row.state === "running") c.set(nx0, nodeCy, "┤", es);
+		if (selected) c.set(sx + 1, nodeCy, ">", "text");
+		y += h + GAP;
 	});
 
-	if (hidden > 0) c.text(1, c.h - 1, `+${hidden} older`, "dim");
+	// Spine hangs from the hub; hidden-above rows read as continuation of it.
+	const lastCy = centers[centers.length - 1];
+	c.set(sx, hy0 + HH - 1, "┬", "borderMuted");
+	c.vline(hy0 + HH, lastCy, sx, "borderMuted");
+	for (const cy of centers) c.set(sx, cy, cy === lastCy ? "└" : "├", "borderMuted");
+
+	if (s > 0) {
+		const up = `↑ ${s} older`;
+		c.text(c.w - up.length - 1, 0, up, "dim");
+	}
+	if (e < agents.length) c.text(1, c.h - 1, `↓ ${agents.length - e} newer`, "dim");
 }
 
 class OrchestraView {
@@ -409,6 +513,15 @@ class OrchestraView {
 		// ctrl+c closes too: never trap the user's abort key behind the view.
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || data === "q") {
 			this.done();
+			return;
+		}
+		if (rows.length === 0) return;
+		if (matchesKey(data, "up") || data === "k") {
+			selectIndex(Math.max(0, selectedIndex() - 1));
+			this.tui.requestRender();
+		} else if (matchesKey(data, "down") || data === "j") {
+			selectIndex(Math.min(rows.length - 1, selectedIndex() + 1));
+			this.tui.requestRender();
 		}
 	}
 
@@ -422,16 +535,17 @@ class OrchestraView {
 			const msg = "no agents yet. task subagents appear here as they run.";
 			c.text(Math.max(0, Math.floor((width - visibleWidth(msg)) / 2)), hy0 + HH + 1, msg, "muted");
 		} else {
+			const sel = selectedIndex();
 			const radialFits =
 				rows.length <= 4 &&
 				width >= 2 * MIN_NODE_W + HW + 2 * SPOKE_H + 4 &&
 				height >= HH + 2 * SPOKE_V + 2 * NH + 3;
-			if (radialFits) layoutRadial(c, [...rows], this.pulse);
-			else if (width >= 60 && height >= 6) layoutFan(c, [...rows], this.pulse);
-			else if (height >= 10) layoutVertical(c, [...rows], this.pulse);
+			if (radialFits) layoutRadial(c, [...rows], this.pulse, sel);
+			else if (width >= 60 && height >= 6) layoutFan(c, [...rows], this.pulse, sel);
+			else if (height >= 10) layoutVertical(c, [...rows], this.pulse, sel);
 			// Below both floors the canvas stays blank but for the hint.
 		}
-		const hint = "esc closes";
+		const hint = rows.length === 0 ? "esc closes" : "↑/↓ navigate · esc closes";
 		c.text(width - hint.length - 1, height - 1, hint, "dim");
 		return c.emit(this.theme);
 	}
@@ -440,10 +554,14 @@ class OrchestraView {
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", () => {
 		rows.length = 0;
+		selectedId = null;
 	});
 
 	pi.on("tool_execution_start", (event) => {
 		if (event.toolName !== TOOL_NAME) return;
+		// Follow the newest agent only when the cursor is already at the tail;
+		// never yank the view away from someone inspecting an older row.
+		const atTail = selectedIndex() === rows.length - 1;
 		rows.push({
 			id: event.toolCallId,
 			agent: String(event.args?.agent ?? "task"),
@@ -451,6 +569,7 @@ export default function (pi: ExtensionAPI) {
 			state: "running",
 			startedAt: Date.now(),
 		});
+		if (atTail) selectedId = event.toolCallId;
 		refreshView?.();
 	});
 
