@@ -57,7 +57,8 @@ function taskPreview(prompt: unknown): string {
 	return String(prompt ?? "")
 		.replace(/[\u0000-\u001f\u007f]/g, " ")
 		.replace(/\s+/g, " ")
-		.trim();
+		.trim()
+		.slice(0, 200);
 }
 
 function formatTokens(count: number): string {
@@ -242,7 +243,7 @@ function drawHub(c: Canvas, x: number, y: number): void {
 	const center = (s: string) => x + Math.max(1, Math.floor((HW - visibleWidth(s)) / 2));
 	c.text(center("main"), y + 1, "main", "textBold");
 	c.text(center(`${t.agents} agents`), y + 2, `${t.agents} agents`, "muted");
-	const stats = t.tokens > 0 ? `${t.turns} turns · ${formatTokens(t.tokens)}` : `${t.turns} turns`;
+	const stats = clip(t.tokens > 0 ? `${t.turns} turns · ${formatTokens(t.tokens)}` : `${t.turns} turns`, HW - 2);
 	c.text(center(stats), y + 3, stats, "dim");
 }
 
@@ -319,6 +320,12 @@ function layoutFan(c: Canvas, agents: AgentRow[], pulse: boolean): void {
 	const lastCy = y0 + (shown.length - 1) * per + 1;
 	if (shown.length === 1) {
 		c.hline(sx + 1, nx0 - 1, firstCy, edgeStyle(shown[0]));
+		// No spine for a lone node: bridge hubMid..firstCy so the branch
+		// isn't floating one row away from the hub connector.
+		if (hubMid !== firstCy) {
+			c.vline(Math.min(firstCy, hubMid), Math.max(firstCy, hubMid), sx, "borderMuted");
+			c.set(sx, firstCy, firstCy < hubMid ? "┌" : "└", "borderMuted");
+		}
 	} else if (shown.length > 1) {
 		c.vline(firstCy, lastCy, sx, "borderMuted");
 		c.set(sx, firstCy, "┌", "borderMuted");
@@ -420,8 +427,9 @@ class OrchestraView {
 				width >= 2 * MIN_NODE_W + HW + 2 * SPOKE_H + 4 &&
 				height >= HH + 2 * SPOKE_V + 2 * NH + 3;
 			if (radialFits) layoutRadial(c, [...rows], this.pulse);
-			else if (width >= 60) layoutFan(c, [...rows], this.pulse);
-			else layoutVertical(c, [...rows], this.pulse);
+			else if (width >= 60 && height >= 6) layoutFan(c, [...rows], this.pulse);
+			else if (height >= 10) layoutVertical(c, [...rows], this.pulse);
+			// Below both floors the canvas stays blank but for the hint.
 		}
 		const hint = "esc closes";
 		c.text(width - hint.length - 1, height - 1, hint, "dim");
@@ -454,11 +462,11 @@ export default function (pi: ExtensionAPI) {
 			| { agent?: string; activity?: string; turns?: number; tokens?: number; model?: string }
 			| undefined;
 		if (!details) return;
-		if (details.agent) row.agent = details.agent;
+		if (details.agent) row.agent = String(details.agent);
 		if (details.activity) row.activity = cleanActivity(details.activity);
 		if (typeof details.turns === "number") row.turns = details.turns;
 		if (typeof details.tokens === "number") row.tokens = details.tokens;
-		if (details.model) row.model = details.model.replace(/[^\w./:-]/g, "");
+		if (details.model) row.model = String(details.model).replace(/[^\w./:-]/g, "");
 		refreshView?.();
 	});
 
@@ -472,7 +480,7 @@ export default function (pi: ExtensionAPI) {
 		const details = event.result?.details as { turns?: number; tokens?: number; model?: string } | undefined;
 		if (typeof details?.turns === "number") row.turns = details.turns;
 		if (typeof details?.tokens === "number") row.tokens = details.tokens;
-		if (details?.model) row.model = details.model.replace(/[^\w./:-]/g, "");
+		if (details?.model) row.model = String(details.model).replace(/[^\w./:-]/g, "");
 		refreshView?.();
 	});
 

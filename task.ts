@@ -2,9 +2,10 @@
  * task — subagent fan-out with a typed agent roster, lite port of omp's `task` tool.
  *
  * Spawns a fresh `pi -p` subprocess per assignment and returns its final text.
- * Subagents run with --no-session so they don't clutter /resume, and can never
- * recurse: agents with a `tools` allowlist simply lack `task`, the rest get it
- * via --exclude-tools.
+ * Subagents run with --no-session so they don't clutter /resume. Recursion is
+ * blocked at the tool level: every subagent gets --exclude-tools task,remember.
+ * (A subagent with bash can still run `pi` itself — closing that needs
+ * pi-level sandboxing, out of scope here.)
  *
  * Agent personas live in ~/.pi/agent/agents/<name>.md with frontmatter:
  *   name, description, tools (comma allowlist), model, thinking-level
@@ -28,6 +29,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -73,7 +75,7 @@ function parseAgent(file: string): AgentDef | null {
 	} catch {
 		return null;
 	}
-	const match = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+	const match = raw.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
 	if (!match) return null;
 	const fields: Record<string, string> = {};
 	for (const line of match[1].split("\n")) {
@@ -191,13 +193,17 @@ function runPi(
 			}
 		};
 
+		const decoder = new StringDecoder("utf8");
 		child.stdout.on("data", (d) => {
-			buffer += d.toString();
+			buffer += decoder.write(d);
 			const lines = buffer.split("\n");
 			buffer = lines.pop() || "";
 			for (const line of lines) processLine(line);
 		});
-		child.stderr.on("data", (d) => (err += d));
+		// Only the tail is used, in the rejection message — cap it.
+		child.stderr.on("data", (d) => {
+			err = (err + d).slice(-8192);
+		});
 		const onAbort = () => child.kill("SIGTERM");
 		signal?.addEventListener("abort", onAbort, { once: true });
 		child.on("error", (e) => {
@@ -206,9 +212,11 @@ function runPi(
 		});
 		child.on("close", (code) => {
 			signal?.removeEventListener("abort", onAbort);
+			buffer += decoder.end();
 			if (buffer.trim()) processLine(buffer);
 			if (code === 0) resolve({ text: progress.lastText.trim() || "(subagent produced no output)", progress });
-			else reject(new Error(`subagent exited ${code}: ${err.trim().slice(0, 500)}`));
+			else if (code === 143 || child.signalCode === "SIGTERM") reject(new Error("subagent cancelled"));
+			else reject(new Error(`subagent exited ${code ?? child.signalCode}: ${err.trim().slice(0, 500)}`));
 		});
 		emit();
 	});
@@ -252,11 +260,11 @@ export default function (pi: ExtensionAPI) {
 			}
 			const args = ["--mode", "json", "-p", "--no-session"];
 			if (def.tools) {
-				// allowlist implicitly excludes task (recursion guard) and remember
 				args.push("--tools", def.tools.join(","));
-			} else {
-				args.push("--exclude-tools", "task,remember");
 			}
+			// pi applies --exclude-tools as a filter over the allowlist too, so
+			// this guards every persona, not just full-access ones.
+			args.push("--exclude-tools", "task,remember");
 			if (def.thinking) args.push("--thinking", def.thinking);
 			// Model ids are identifiers; strip anything outside the safe charset
 			// (k3 sometimes leaks literal "[0m" garbage into string params).

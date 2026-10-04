@@ -16,16 +16,16 @@ ln -sfn ~/Documents/visual-orchestra ~/.pi/agent/extensions/visual-orchestra
 ln -sfn ~/Documents/visual-orchestra/task.ts ~/.pi/agent/extensions/task.ts
 ```
 
-Restart pi. The third symlink is the bundled streaming `task` tool — skip it if
-you already have one (see below).
+Restart pi. The last line installs the bundled streaming `task` tool — skip
+it if you already have one (see below).
 
 ## Usage
 
-- `/orchestra` or `ctrl+alt+o`: open the board (idle or mid-turn)
-- `esc` or `q`: close
+- `/orchestra` or `ctrl+alt+o`: open the board (idle or mid-turn; interactive mode only)
+- `esc`, `q`, or `ctrl+c`: close
 
-Layout adapts: radial for up to 4 agents, horizontal fan beyond that, vertical
-on narrow terminals.
+Layout adapts: radial for up to 4 agents when it fits (~88×22 minimum),
+horizontal fan beyond that, vertical on narrow terminals.
 
 ![fan layout — five agents in a column beside the hub](fan-layout.png)
 
@@ -37,12 +37,14 @@ Tracks `tool_execution_start` / `tool_execution_update` / `tool_execution_end`
 for the `task` tool, keyed by `toolCallId`. Live activity requires a task tool
 that streams `onUpdate` partials with details
 `{ agent, activity, turns, tokens, model }` — the bundled `task.ts` does this
-at zero token cost. Without it the board degrades gracefully: agent,
+at zero token cost. It spawns `pi` subprocesses (so `pi` must be on PATH) and
+reads agent personas from `~/.pi/agent/agents/*.md`, falling back to a generic
+worker. Without streaming partials the board degrades gracefully: agent,
 assignment, state, elapsed.
 
 Set `PI_ORCHESTRA_TOOL` to watch a different tool name.
 
 ## Requirements
 
-- pi 0.87.1 or newer (needs the `tool_execution_update` extension event)
+- pi 0.52.10 or newer (needs the `tool_execution_update` extension event; tested on 1.0.0)
 - A `task` tool for anything to appear on the board
