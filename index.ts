@@ -2,11 +2,14 @@
  * visual-orchestra — a live, zero-token board of task subagents.
  *
  * Observes tool_execution_start/update/end events for the task tool and
- * renders a node graph: the main session as a hub, one node per subagent,
- * spokes between them. Layout adapts to the terminal: radial constellation
- * for up to 4 agents on wide terminals, horizontal fan beyond that, vertical
- * fan on narrow terminals. Pure event observation: no model calls, nothing
- * added to context. The /orchestra command itself never enters the transcript.
+ * renders a node graph: the main session as a hub (with its model), one node
+ * per subagent, spokes between them. Every running node states its assignment
+ * (task:) and its live activity (now:). Layout adapts to the terminal: radial
+ * constellation for up to 4 agents on wide terminals, horizontal fan beyond
+ * that, vertical fan on narrow terminals. Nodes fill the available width and
+ * slack vertical space spreads the branches. Pure event observation: no model
+ * calls, nothing added to context. The /orchestra command itself never enters
+ * the transcript.
  *
  * Open with /orchestra or ctrl+alt+o, mid-turn or idle. Esc closes.
  *
@@ -63,6 +66,16 @@ function selectIndex(i: number): void {
 
 /** Set while the view is open; event handlers poke it to re-render. */
 let refreshView: (() => void) | undefined;
+
+/** Main session model id, shown in the hub. From ctx.model / model_select. */
+let mainModel: string | undefined;
+
+/** Model ids are identifiers; strip anything outside the safe charset
+ *  (k3 sometimes leaks literal "[0m" garbage into string params). */
+function modelIdOf(m: unknown): string | undefined {
+	const s = String(m ?? "").replace(/[^\w./:-]/g, "");
+	return s || undefined;
+}
 
 function taskPreview(prompt: unknown): string {
 	// Strip control chars (incl. real ESC bytes) so a hostile or glitchy
@@ -121,6 +134,34 @@ function totals(): { agents: number; turns: number; tokens: number } {
 function clip(text: string, max: number): string {
 	if (max <= 1) return "";
 	return visibleWidth(text) > max ? truncateToWidth(text, max, "…") : text;
+}
+
+/** Greedy word wrap to at most maxLines, width-aware; leftover text ellipsizes
+ *  the last line. Always returns at least one line so height math stays stable. */
+function wrapText(s: string, width: number, maxLines: number): string[] {
+	maxLines = Math.max(1, maxLines);
+	const out: string[] = [];
+	let cur = "";
+	if (width > 1) {
+		for (const word of s.split(" ").filter(Boolean)) {
+			const next = cur ? `${cur} ${word}` : word;
+			if (visibleWidth(next) <= width) {
+				cur = next;
+			} else {
+				if (cur) out.push(cur);
+				// A word longer than the line stands alone, clipped.
+				cur = visibleWidth(word) > width ? clip(word, width) : word;
+			}
+		}
+		if (cur) out.push(cur);
+	}
+	if (out.length === 0) out.push(clip(s, Math.max(1, width)));
+	if (out.length > maxLines) {
+		const rest = out.slice(maxLines - 1).join(" ");
+		out.length = maxLines;
+		out[maxLines - 1] = clip(rest, width);
+	}
+	return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -221,12 +262,16 @@ class Canvas {
 // ---------------------------------------------------------------------------
 // Graph drawing
 
-const NH = 4; // agent node height
-const HW = 20; // hub width
-const HH = 5; // hub height
+const NH_FIN = 4; // finished node height (radial layout): task + stats
+const NH_RUN = 5; // running node height: task + now + stats
 const SPOKE_H = 6;
-const SPOKE_V = 3;
+const SPOKE_V = 2;
 const MIN_NODE_W = 26;
+
+/** Hub geometry, recomputed each render by measureHub(): the model line makes
+ *  both dimensions content-dependent. Layouts read these render-scoped values. */
+let HW = 20;
+let HH = 5;
 
 function stateGlyph(row: AgentRow, pulse: boolean): { ch: string; style: StyleName } {
 	if (row.state === "running") return { ch: pulse ? "○" : "●", style: "accent" };
@@ -234,15 +279,31 @@ function stateGlyph(row: AgentRow, pulse: boolean): { ch: string; style: StyleNa
 	return { ch: "✗", style: "error" };
 }
 
-/**
- * Row height in the scrollable layouts. Running agents keep the full box
- * (selected adds a task line); finished agents collapse to a one-line row
- * (selected adds a full task line below it). Must stay in sync with
- * drawAgentNode / drawCompactRow.
- */
-function rowHeight(row: AgentRow, selected: boolean): number {
-	if (row.state === "running") return selected ? NH + 1 : NH;
-	return selected ? 2 : 1;
+const LABEL_W = 6; // "task: " / "now:  " prefix width inside nodes
+
+/** Task lines inside a node: one, or two when the selected row expands. The
+ *  width must match the draw call exactly — row heights derive from this. */
+function taskLines(row: AgentRow, nodeW: number, selected: boolean, expand: boolean): string[] {
+	return wrapText(row.task, nodeW - 4 - LABEL_W, selected && expand ? 2 : 1);
+}
+
+/** Box height for drawAgentNode. Finished nodes are task + stats; running adds
+ *  the now line and, when selected and expanded, a second task line. */
+function nodeHeight(row: AgentRow, nodeW: number, selected: boolean, expand: boolean): number {
+	if (row.state !== "running") return NH_FIN;
+	return NH_RUN + taskLines(row, nodeW, selected, expand).length - 1;
+}
+
+/** Compact finished row height: one line, plus up to two wrapped task lines
+ *  when selected. w is the row width passed to drawCompactRow. */
+function compactHeight(row: AgentRow, w: number, selected: boolean): number {
+	return selected ? 1 + wrapText(row.task, w - 2, 2).length : 1;
+}
+
+/** Row height in the scrollable layouts. Must stay in sync with drawAgentNode
+ *  / drawCompactRow, which it shares taskLines / wrapText calls with. */
+function rowHeight(row: AgentRow, w: number, selected: boolean): number {
+	return row.state === "running" ? nodeHeight(row, w, selected, true) : compactHeight(row, w, selected);
 }
 
 /** Box-drawing junction for the given open sides. */
@@ -262,8 +323,9 @@ function edgeStyle(row: AgentRow): StyleName {
 	return row.state === "running" ? "accent" : "borderMuted";
 }
 
-/** Node: title embedded in the top border, one content line, one stats line.
- *  Selected running nodes expand by one line to show the task as well. */
+/** Node: title embedded in the top border, then the assignment (task:), the
+ *  live activity for running agents (now:), and a stats line. The selected
+ *  expanded node wraps the task onto a second line. */
 function drawAgentNode(
 	c: Canvas,
 	row: AgentRow,
@@ -274,7 +336,7 @@ function drawAgentNode(
 	selected: boolean,
 	expand: boolean,
 ): void {
-	const h = expand && selected && row.state === "running" ? NH + 1 : NH;
+	const h = nodeHeight(row, w, selected, expand);
 	const border: StyleName = selected ? "text" : edgeStyle(row);
 	c.box(x, y, w, h, border);
 	const glyph = stateGlyph(row, pulse);
@@ -284,12 +346,17 @@ function drawAgentNode(
 	c.set(x + 1, y, "─", border);
 	c.text(x + 2, y, ` ${glyph.ch} `, glyph.style);
 	c.text(x + 5, y, `${name} `, nameStyle);
+	const cw = w - 4 - LABEL_W;
 	let line = y + 1;
+	const lines = taskLines(row, w, selected, expand);
+	c.text(x + 2, line, "task: ", "muted");
+	c.text(x + 2 + LABEL_W, line, lines[0], "dim");
+	for (const extra of lines.slice(1)) c.text(x + 2 + LABEL_W, ++line, extra, "dim");
+	line++;
 	if (row.state === "running") {
-		c.text(x + 2, line++, clip(row.activity || "starting", w - 4), "dim");
-		if (selected && expand) c.text(x + 2, line++, clip(row.task, w - 4), "dim");
-	} else {
-		c.text(x + 2, line++, clip(row.task, w - 4), "dim");
+		c.text(x + 2, line, "now:  ", "muted");
+		c.text(x + 2 + LABEL_W, line, clip(row.activity || "starting", cw), "dim");
+		line++;
 	}
 	c.text(x + 2, line, clip(statLine(row), w - 4), "muted");
 }
@@ -305,7 +372,7 @@ function drawCompactRow(c: Canvas, row: AgentRow, x: number, y: number, w: numbe
 	const name = clip(row.agent, Math.max(1, Math.min(24, w - statsW - 6)));
 	c.text(x + 2, y, name, selected ? "textBold" : "muted");
 	if (selected) {
-		c.text(x + 2, y + 1, clip(row.task, w - 2), "dim");
+		wrapText(row.task, w - 2, 2).forEach((l, i) => c.text(x + 2, y + 1 + i, l, "dim"));
 	} else {
 		const taskX = x + 2 + visibleWidth(name) + 2;
 		const taskW = x + w - statsW - 2 - taskX;
@@ -313,53 +380,70 @@ function drawCompactRow(c: Canvas, row: AgentRow, x: number, y: number, w: numbe
 	}
 }
 
+/** Hub content: name, the main session's model when known, agent count,
+ *  aggregate turns/tokens. */
+function hubLines(): Array<[string, StyleName]> {
+	const t = totals();
+	const stats = t.tokens > 0 ? `${t.turns} turns · ${formatTokens(t.tokens)}` : `${t.turns} turns`;
+	const lines: Array<[string, StyleName]> = [["main", "textBold"]];
+	if (mainModel) lines.push([mainModel, "muted"]);
+	lines.push([`${t.agents} agents`, "muted"], [stats, "dim"]);
+	return lines;
+}
+
+/** Size the hub to its content; called once per render before layout. */
+function measureHub(): void {
+	const lines = hubLines();
+	HW = Math.min(34, Math.max(20, Math.max(...lines.map(([s]) => visibleWidth(s))) + 4));
+	HH = lines.length + 2;
+}
+
 function drawHub(c: Canvas, x: number, y: number): void {
 	c.box(x, y, HW, HH, "text");
-	const t = totals();
-	const center = (s: string) => x + Math.max(1, Math.floor((HW - visibleWidth(s)) / 2));
-	c.text(center("main"), y + 1, "main", "textBold");
-	c.text(center(`${t.agents} agents`), y + 2, `${t.agents} agents`, "muted");
-	const stats = clip(t.tokens > 0 ? `${t.turns} turns · ${formatTokens(t.tokens)}` : `${t.turns} turns`, HW - 2);
-	c.text(center(stats), y + 3, stats, "dim");
+	hubLines().forEach(([s, style], i) => {
+		const line = clip(s, HW - 2);
+		c.text(x + Math.max(1, Math.floor((HW - visibleWidth(line)) / 2)), y + 1 + i, line, style);
+	});
 }
 
 /** Radial: hub center, nodes on cross spokes. Caller guarantees n <= 4 and fit.
- *  No scrolling here: selection only brightens the node (expand would break the slots). */
+ *  No scrolling here: selection only brightens the node (expansion would break
+ *  the slots). Node widths fill the horizontal space instead of capping out. */
 function layoutRadial(c: Canvas, agents: AgentRow[], pulse: boolean, sel: number): void {
 	const cx = Math.floor(c.w / 2);
 	const cy = Math.floor(c.h / 2);
-	const NW = Math.max(MIN_NODE_W, Math.min(38, Math.floor((c.w - HW - 2 * SPOKE_H - 4) / 2)));
+	const NW = Math.max(MIN_NODE_W, Math.floor((c.w - HW - 2 * SPOKE_H - 4) / 2));
 	const hx0 = cx - Math.floor(HW / 2);
 	const hy0 = cy - Math.floor(HH / 2);
-	const slots: Array<[number, number]> = [
-		[hx0 - SPOKE_H - NW, cy - 2], // left
-		[hx0 + HW + SPOKE_H, cy - 2], // right
-		[cx - Math.floor(NW / 2), hy0 - SPOKE_V - NH], // top
-		[cx - Math.floor(NW / 2), hy0 + HH + SPOKE_V], // bottom
-	];
 	const pick = [[1], [0, 1], [0, 1, 3], [0, 1, 2, 3]][agents.length - 1];
 
 	drawHub(c, hx0, hy0);
 	agents.forEach((row, i) => {
-		const [nx, ny] = slots[pick[i]];
+		const side = pick[i];
+		const h = nodeHeight(row, NW, i === sel, false);
+		let nx: number, ny: number;
+		if (side === 0) [nx, ny] = [hx0 - SPOKE_H - NW, cy - Math.floor(h / 2)];
+		else if (side === 1) [nx, ny] = [hx0 + HW + SPOKE_H, cy - Math.floor(h / 2)];
+		else if (side === 2) [nx, ny] = [cx - Math.floor(NW / 2), hy0 - SPOKE_V - h];
+		else [nx, ny] = [cx - Math.floor(NW / 2), hy0 + HH + SPOKE_V];
 		drawAgentNode(c, row, nx, ny, NW, pulse, i === sel, false);
 		if (i === sel) c.text(nx - 2, ny, ">", "text");
 		const es = edgeStyle(row);
-		if (pick[i] === 1) {
+		if (side === 1) {
 			// right: straight horizontal at cy
 			c.set(hx0 + HW - 1, cy, "├", es);
 			c.hline(hx0 + HW, nx - 1, cy, es);
 			c.set(nx, cy, "┤", es);
-		} else if (pick[i] === 0) {
+		} else if (side === 0) {
 			// left
 			c.set(hx0, cy, "┤", es);
 			c.hline(nx + NW, hx0 - 1, cy, es);
 			c.set(nx + NW - 1, cy, "├", es);
-		} else if (pick[i] === 2) {
+		} else if (side === 2) {
 			// top: straight vertical at cx
 			c.set(cx, hy0, "┴", es);
-			c.vline(ny + NH, hy0 - 1, cx, es);
-			c.set(cx, ny + NH - 1, "┬", es);
+			c.vline(ny + h, hy0 - 1, cx, es);
+			c.set(cx, ny + h - 1, "┬", es);
 		} else {
 			// bottom
 			c.set(cx, hy0 + HH - 1, "┬", es);
@@ -370,7 +454,8 @@ function layoutRadial(c: Canvas, agents: AgentRow[], pulse: boolean, sel: number
 }
 
 /** Fan: hub left, vertical spine, one branch per agent. For wide terminals.
- *  Overflow: shows a scroll window around the selected row instead of
+ *  Slack vertical space spreads the branches (capped) so the board fills the
+ *  screen. Overflow: shows a scroll window around the selected row instead of
  *  silently dropping old agents; ↑/↓ indicators mark hidden ends. */
 function layoutFan(c: Canvas, agents: AgentRow[], pulse: boolean, sel: number): void {
 	const hx0 = 2;
@@ -378,16 +463,17 @@ function layoutFan(c: Canvas, agents: AgentRow[], pulse: boolean, sel: number): 
 	const nx0 = sx + 4;
 	const NW = Math.max(MIN_NODE_W, c.w - nx0 - 2);
 	const GAP = 1;
-	const heights = agents.map((r, i) => rowHeight(r, i === sel));
+	const heights = agents.map((r, i) => rowHeight(r, r.state === "running" ? NW : NW - 3, i === sel));
 	const total = heights.reduce((a, b) => a + b, 0) + GAP * (agents.length - 1);
 	const fits = total <= c.h - 2;
+	const gap = fits && agents.length > 1 ? GAP + Math.min(3, Math.floor((c.h - 2 - total) / (agents.length - 1))) : GAP;
 	// Overflow: row 0 stays free for the ↑ indicator, the last for hints.
 	const [s, e] = fits ? [0, agents.length] : scrollWindow(heights, GAP, Math.max(1, c.h - 3), sel);
 	const shownH = heights.slice(s, e);
-	const stackH = shownH.reduce((a, b) => a + b, 0) + GAP * (shownH.length - 1);
+	const stackH = shownH.reduce((a, b) => a + b, 0) + gap * (shownH.length - 1);
 	const y0 = fits ? Math.max(1, Math.floor((c.h - stackH) / 2)) : 1;
 	const hy0 = Math.min(Math.max(1, Math.floor(c.h / 2) - Math.floor(HH / 2)), c.h - HH - 1);
-	const hubMid = hy0 + 2;
+	const hubMid = hy0 + Math.floor(HH / 2);
 
 	drawHub(c, hx0, hy0);
 
@@ -395,7 +481,7 @@ function layoutFan(c: Canvas, agents: AgentRow[], pulse: boolean, sel: number): 
 	let y = y0;
 	agents.slice(s, e).forEach((row, i) => {
 		const h = shownH[i];
-		const nodeCy = h >= NH ? y + 1 : y;
+		const nodeCy = y + Math.floor((h - 1) / 2);
 		centers.push(nodeCy);
 		const selected = s + i === sel;
 		if (row.state === "running") {
@@ -407,7 +493,7 @@ function layoutFan(c: Canvas, agents: AgentRow[], pulse: boolean, sel: number): 
 		c.hline(sx + 1, row.state === "running" ? nx0 - 1 : nx0, nodeCy, es);
 		if (row.state === "running") c.set(nx0, nodeCy, "┤", es);
 		if (selected) c.set(sx + 1, nodeCy, ">", "text");
-		y += h + GAP;
+		y += h + gap;
 	});
 
 	// Spine spans the visible branches and reaches hubMid, so the hub
@@ -441,10 +527,11 @@ function layoutVertical(c: Canvas, agents: AgentRow[], pulse: boolean, sel: numb
 	const NW = Math.max(12, c.w - nx0 - 1);
 	const GAP = 1;
 	const top = hy0 + HH + 1;
-	const heights = agents.map((r, i) => rowHeight(r, i === sel));
+	const heights = agents.map((r, i) => rowHeight(r, r.state === "running" ? NW : NW - 3, i === sel));
 	const total = heights.reduce((a, b) => a + b, 0) + GAP * (agents.length - 1);
 	const avail = Math.max(1, c.h - top - 1);
 	const fits = total <= avail;
+	const gap = fits && agents.length > 1 ? GAP + Math.min(3, Math.floor((avail - total) / (agents.length - 1))) : GAP;
 	const [s, e] = fits ? [0, agents.length] : scrollWindow(heights, GAP, avail, sel);
 	const shownH = heights.slice(s, e);
 
@@ -454,7 +541,7 @@ function layoutVertical(c: Canvas, agents: AgentRow[], pulse: boolean, sel: numb
 	let y = top;
 	agents.slice(s, e).forEach((row, i) => {
 		const h = shownH[i];
-		const nodeCy = h >= NH ? y + 1 : y;
+		const nodeCy = y + Math.floor((h - 1) / 2);
 		centers.push(nodeCy);
 		const selected = s + i === sel;
 		if (row.state === "running") {
@@ -466,7 +553,7 @@ function layoutVertical(c: Canvas, agents: AgentRow[], pulse: boolean, sel: numb
 		c.hline(sx + 1, row.state === "running" ? nx0 - 1 : nx0, nodeCy, es);
 		if (row.state === "running") c.set(nx0, nodeCy, "┤", es);
 		if (selected) c.set(sx + 1, nodeCy, ">", "text");
-		y += h + GAP;
+		y += h + gap;
 	});
 
 	// Spine hangs from the hub; hidden-above rows read as continuation of it.
@@ -527,6 +614,7 @@ class OrchestraView {
 
 	render(width: number): string[] {
 		const height = process.stdout.rows ?? 24;
+		measureHub();
 		const c = new Canvas(width, height);
 		if (rows.length === 0) {
 			const hx0 = Math.max(0, Math.floor((width - HW) / 2));
@@ -539,10 +627,10 @@ class OrchestraView {
 			const radialFits =
 				rows.length <= 4 &&
 				width >= 2 * MIN_NODE_W + HW + 2 * SPOKE_H + 4 &&
-				height >= HH + 2 * SPOKE_V + 2 * NH + 3;
+				height >= HH + 2 * SPOKE_V + 2 * NH_RUN + 3;
 			if (radialFits) layoutRadial(c, [...rows], this.pulse, sel);
-			else if (width >= 60 && height >= 6) layoutFan(c, [...rows], this.pulse, sel);
-			else if (height >= 10) layoutVertical(c, [...rows], this.pulse, sel);
+			else if (width >= 60 && height >= 8) layoutFan(c, [...rows], this.pulse, sel);
+			else if (height >= 12) layoutVertical(c, [...rows], this.pulse, sel);
 			// Below both floors the canvas stays blank but for the hint.
 		}
 		const hint = rows.length === 0 ? "esc closes" : "↑/↓ navigate · esc closes";
@@ -552,13 +640,20 @@ class OrchestraView {
 }
 
 export default function (pi: ExtensionAPI) {
-	pi.on("session_start", () => {
+	pi.on("session_start", (_event, ctx) => {
 		rows.length = 0;
 		selectedId = null;
+		mainModel = modelIdOf(ctx?.model?.id);
 	});
 
-	pi.on("tool_execution_start", (event) => {
+	pi.on("model_select", (event) => {
+		mainModel = modelIdOf(event.model?.id);
+		refreshView?.();
+	});
+
+	pi.on("tool_execution_start", (event, ctx) => {
 		if (event.toolName !== TOOL_NAME) return;
+		mainModel = modelIdOf(ctx?.model?.id) ?? mainModel;
 		// Follow the newest agent only when the cursor is already at the tail;
 		// never yank the view away from someone inspecting an older row.
 		const atTail = selectedIndex() === rows.length - 1;
@@ -608,6 +703,7 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("orchestra view needs interactive mode", "error");
 			return;
 		}
+		mainModel = modelIdOf(ctx.model?.id) ?? mainModel;
 		if (refreshView) return; // already open
 		await ctx.ui.custom(
 			(tui, theme, _keybindings, done) => {

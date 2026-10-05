@@ -2,11 +2,12 @@
 
 A live, zero-token subagent board for [pi](https://github.com/earendil-works/pi).
 
-The main session as a hub, one node per subagent: state, live activity, turns,
-tokens, model, elapsed. Pure event observation — no model calls, nothing added
-to context, the command that opens it never enters the transcript.
+The main session as a hub (model included), one node per subagent: state,
+assignment, live activity, turns, tokens, model, elapsed. Pure event
+observation — no model calls, nothing added to context, the command that
+opens it never enters the transcript.
 
-![radial layout — hub with four subagent nodes on spokes](radial-layout.png)
+![radial layout — hub with four subagent nodes on spokes](radial-layout.gif)
 
 ## Install
 
@@ -22,16 +23,18 @@ it if you already have one (see below).
 ## Usage
 
 - `/orchestra` or `ctrl+alt+o`: open the board (idle or mid-turn; interactive mode only)
-- `↑`/`↓` or `j`/`k`: move the selection; the selected agent expands to show its full task alongside its live activity
+- running nodes always show their assignment (`task:`) and live activity (`now:`)
+- `↑`/`↓` or `j`/`k`: move the selection; the selected row wraps its assignment across two lines
 - `esc`, `q`, or `ctrl+c`: close
 
-Layout adapts: radial for up to 4 agents when it fits (~88×22 minimum),
-horizontal fan beyond that, vertical on narrow terminals. Finished agents
-collapse to one-line rows so a long history stays readable; when the list
-overflows the screen the fan and vertical layouts scroll with the selection,
-with `↑ N older` / `↓ N newer` markers at the hidden ends.
+Layout adapts: radial for up to 4 agents when it fits, horizontal fan beyond
+that, vertical on narrow terminals. Nodes fill the available width and slack
+vertical space spreads the branches. Finished agents collapse to one-line rows
+so a long history stays readable; when the list overflows the screen the fan
+and vertical layouts scroll with the selection, with `↑ N older` / `↓ N newer`
+markers at the hidden ends.
 
-![fan layout — ten agents, finished ones compacted, selection expanded](fan-layout.png)
+![fan layout — ten agents, finished ones compacted, selection expanded](fan-layout.gif)
 
 ## How it works
 
@@ -54,4 +57,5 @@ Set `PI_ORCHESTRA_TOOL` to watch a different tool name.
 ## Development
 
 - `node --test test/` — regression suite (settlement logic in `task.ts`, scroll-window math in `windowing.ts`)
-- `node scripts/demo.mjs --agents 10 --running 3 --keys up,up` — render the board with synthetic events, no model calls; used for the screenshots above
+- `node scripts/demo.mjs --agents 10 --running 3 --keys up,up` — render the board once with synthetic events, no model calls
+- `vhs scripts/radial.tape && vhs scripts/fan.tape` — regenerate the README GIFs (needs [VHS](https://github.com/charmbracelet/vhs); drives `demo.mjs --live`, which streams a scripted event timeline and answers stdin keys)
